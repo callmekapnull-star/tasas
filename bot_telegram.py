@@ -4,6 +4,7 @@
 #          comandos públicos de cálculo y comandos de admin.
 
 import os
+import json
 import time
 import math
 import asyncio
@@ -50,7 +51,7 @@ CANAL_INICIAL = os.environ.get("CANAL", "@BancaYDivisaVe")
 
 # aqui va la URL del microservicio de tasas
 # - Local:  http://127.0.0.1:8000/rates
-# - Render: http://banca-divisa-rates:8000/rates
+# - Render: https://<servicio-rates>.onrender.com/rates
 RATES_URL = os.environ.get("RATES_SERVICE_URL", "http://127.0.0.1:8000/rates")
 
 # aqui va la URL pública del bot (Render la asigna)
@@ -574,15 +575,28 @@ async def comando_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Espera *{espera}* segundos.", parse_mode="Markdown")
         return
 
+    # Diagnóstico: qué URL usa el bot
+    print(f"[bot] /usdt → GET {RATES_URL}")
+
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get(RATES_URL, timeout=aiohttp.ClientTimeout(total=60)) as r:
+            async with s.get(RATES_URL, timeout=aiohttp.ClientTimeout(total=90)) as r:
+                cuerpo = await r.text()
                 if r.status != 200:
-                    raise Exception(f"HTTP {r.status}")
-                data = await r.json()
+                    raise Exception(f"HTTP {r.status} → {cuerpo[:250]}")
+                try:
+                    data = json.loads(cuerpo)
+                except Exception:
+                    raise Exception(f"respuesta no es JSON → {cuerpo[:250]}")
     except Exception as e:
-        print(f"[bot] rates_service no disponible: {e}")
-        await update.message.reply_text("El servicio de tasas está iniciando. Intenta en unos segundos.")
+        err = f"{type(e).__name__}: {str(e)[:250]}"
+        print(f"[bot] rates_service no disponible: {err}")
+        await update.message.reply_text(
+            f"⚠️ No pude consultar tasas.\n\n"
+            f"URL: `{RATES_URL}`\n\n"
+            f"Error:\n`{err}`",
+            parse_mode="Markdown",
+        )
         return
 
     compra = data["compra"]
