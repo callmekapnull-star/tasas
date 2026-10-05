@@ -35,7 +35,7 @@ from db_postgres import (
     get_config,
     listar_config,
 )
-from monitor_p2p import consultar_tasas_bcv
+from monitor_p2p import consultar_tasas_bcv, fetch_rates
 
 # ============================================================
 #  CONFIGURACIÓN (Environment Variables de Render)
@@ -49,11 +49,6 @@ ADMIN_ID_INICIAL = int(os.environ["ADMIN_ID"])
 # aqui va el canal inicial (solo se usa en el primer arranque)
 CANAL_INICIAL = os.environ.get("CANAL", "@BancaYDivisaVe")
 
-# aqui va la URL del microservicio de tasas
-# - Local:  http://127.0.0.1:8000/rates
-# - Render: https://<servicio-rates>.onrender.com/rates
-RATES_URL = os.environ.get("RATES_SERVICE_URL", "http://127.0.0.1:8000/rates")
-
 # aqui va la URL pública del bot (Render la asigna)
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 
@@ -63,6 +58,9 @@ COMISION_MENUDEO = 0.012
 COOLDOWN_SEGUNDOS = 2
 INTERVALO_BUSQUEDA = 300
 ARCHIVO_PLANTILLA = "plantilla.jpg"
+
+# aqui va el monto con el que se consulta Binance P2P (en VES)
+MONTO_BINANCE = 100000
 
 # ============================================================
 #  ESTADO EN MEMORIA
@@ -575,27 +573,23 @@ async def comando_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Espera *{espera}* segundos.", parse_mode="Markdown")
         return
 
-    # Diagnóstico: qué URL usa el bot
-    print(f"[bot] /usdt → GET {RATES_URL}")
-
+    # Consulta Binance P2P directamente (en un hilo para no bloquear el event loop)
+    print(f"[bot] /usdt → consultando Binance P2P (monto={MONTO_BINANCE})")
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(RATES_URL, timeout=aiohttp.ClientTimeout(total=90)) as r:
-                cuerpo = await r.text()
-                if r.status != 200:
-                    raise Exception(f"HTTP {r.status} → {cuerpo[:250]}")
-                try:
-                    data = json.loads(cuerpo)
-                except Exception:
-                    raise Exception(f"respuesta no es JSON → {cuerpo[:250]}")
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(None, fetch_rates, MONTO_BINANCE)
     except Exception as e:
-        err = f"{type(e).__name__}: {str(e)[:250]}"
-        print(f"[bot] rates_service no disponible: {err}")
+        err = f"{type(e).__name__}: {str(e)[:300]}"
+        print(f"[bot] /usdt error Binance: {err}")
         await update.message.reply_text(
-            f"⚠️ No pude consultar tasas.\n\n"
-            f"URL: `{RATES_URL}`\n\n"
-            f"Error:\n`{err}`",
+            f"⚠️ No pude consultar Binance P2P.\n\nError:\n`{err}`",
             parse_mode="Markdown",
+        )
+        return
+
+    if not data or (data["compra"] == 0 and data["venta"] == 0):
+        await update.message.reply_text(
+            "Binance no devolvió datos en este momento.\nIntenta de nuevo en unos minutos."
         )
         return
 
