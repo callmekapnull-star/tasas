@@ -1,0 +1,85 @@
+# render.yaml
+# Blueprint de Render: define la base de datos y los 2 servicios web.
+
+databases:
+  # ============================================================
+  #  aqui va la base de datos PostgreSQL managed
+  #  Render la crea automáticamente y la conecta a los servicios
+  # ============================================================
+  - name: banca-divisa-db
+    plan: free
+    databaseName: tasas
+    user: banca_user
+    region: oregon          # opcional: cambia según tu ubicación (oregon, frankfurt, ohio, singapore)
+
+services:
+  # ============================================================
+  #  aqui va el servicio del BOT de Telegram
+  #  Recibe los webhooks de Telegram y ejecuta los comandos
+  # ============================================================
+  - type: web
+    name: banca-divisa-bot
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main_bot:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # aqui va el token del bot (lo pones manualmente en el dashboard)
+      - key: BOT_TOKEN
+        sync: false
+
+      # aqui va el ID del admin inicial (solo se usa en el primer arranque,
+      # después se gestiona desde el bot con /addadmin y /deladmin)
+      - key: ADMIN_ID
+        sync: false
+
+      # aqui va el canal inicial (solo se usa en el primer arranque,
+      # después se cambia desde el bot con /canal @nuevo)
+      - key: CANAL
+        value: "@BancaYDivisaVe"
+
+      # aqui va la URL de PostgreSQL (Render la inyecta automáticamente)
+      - key: DATABASE_URL
+        fromDatabase:
+          name: banca-divisa-db
+          property: connectionString
+
+      # aqui va la URL interna del servicio de tasas
+      # Render resuelve "banca-divisa-rates" por red privada
+      - key: RATES_SERVICE_URL
+        value: "http://banca-divisa-rates:8000/rates"
+
+      # aqui va la URL pública del bot
+      # La pones manualmente DESPUÉS del primer deploy, con la URL que Render asigne
+      # Ejemplo: https://banca-divisa-bot.onrender.com
+      - key: WEBHOOK_URL
+        sync: false
+
+  # ============================================================
+  #  aqui va el servicio de TASAS (microservicio FastAPI)
+  #  Consulta Binance P2P cada 30s, cachea y persiste en PostgreSQL
+  # ============================================================
+  - type: web
+    name: banca-divisa-rates
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    # aqui va el puerto FIJO 8000 (debe coincidir con RATES_SERVICE_URL del bot)
+    startCommand: uvicorn rates_service:app --host 0.0.0.0 --port 8000
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # aqui va el puerto que escucha el servicio
+      # (fijo para que el bot lo encuentre por red interna)
+      - key: PORT
+        value: "8000"
+
+      # aqui va la URL de PostgreSQL (Render la inyecta automáticamente)
+      - key: DATABASE_URL
+        fromDatabase:
+          name: banca-divisa-db
+          property: connectionString
