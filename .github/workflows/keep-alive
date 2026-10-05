@@ -3,8 +3,8 @@ name: Keep Render App Alive
 
 on:
   schedule:
-    # Se ejecuta cada 10 minutos. El intervalo mínimo en GitHub Actions es de 5 min.
-    - cron: '*/10 * * * *'
+    # Se ejecuta cada 4 minutos. El intervalo mínimo en GitHub Actions es de 5 min.
+    - cron: '*/4 * * * *'
   workflow_dispatch: # Permite ejecutarlo manualmente desde la pestaña "Actions".
 
 jobs:
