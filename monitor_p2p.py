@@ -7,6 +7,7 @@ import json
 import requests
 from datetime import datetime
 
+
 # ============================================================
 #  BINANCE P2P
 # ============================================================
@@ -14,8 +15,20 @@ URL_BINANCE_P2P = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 
 HEADERS_BINANCE = {
     "Content-Type": "application/json",
+    "Accept": "*/*",
     "Accept-Encoding": "gzip, deflate, br",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    "Origin": "https://p2p.binance.com",
+    "Referer": "https://p2p.binance.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "sec-ch-ua": '"Chromium";v="120", "Not_A Brand";v="8"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Connection": "keep-alive",
 }
 
 # aqui van los métodos de pago que aceptamos
@@ -25,8 +38,33 @@ PAY_TYPES_DEFAULT = ["Banesco", "Mercantil", "Provincial"]
 IMPORTE_DEFAULT = 100000
 
 
+def _descomprimir(r):
+    """Devuelve el cuerpo de la respuesta ya descomprimido (bytes)."""
+    encoding = (r.headers.get("Content-Encoding") or "").lower()
+    raw = r.content
+    try:
+        if encoding == "gzip":
+            raw = gzip.decompress(raw)
+        elif encoding == "deflate":
+            raw = zlib.decompress(raw)
+        elif encoding == "br":
+            try:
+                import brotli
+                raw = brotli.decompress(raw)
+            except ImportError:
+                # requests normalmente ya descomprime br si tiene brotli
+                pass
+    except Exception as e:
+        print(f"[binance] no pude descomprimir ({encoding}): {e}")
+    return raw
+
+
 def obtener_tasas_binance(monto_consulta, trade_type, pay_types=None, fiat="VES"):
-    """Consulta el endpoint P2P de Binance. Retorna el JSON completo."""
+    """
+    Consulta el endpoint P2P de Binance.
+    Lanza excepción con detalle si la conexión, el HTTP o el JSON fallan.
+    Retorna el JSON completo.
+    """
     if pay_types is None:
         pay_types = PAY_TYPES_DEFAULT
 
@@ -44,57 +82,85 @@ def obtener_tasas_binance(monto_consulta, trade_type, pay_types=None, fiat="VES"
         "transAmount": str(monto_consulta),
     }
 
-    r = requests.post(
-        URL_BINANCE_P2P,
-        data=json.dumps(body),
-        headers=HEADERS_BINANCE,
-        timeout=20,
-        verify=False,
-    )
-    r.raise_for_status()
-
-    # Descompresión explícita por si requests no lo hace
-    encoding = r.headers.get("Content-Encoding", "").lower()
-    raw = r.content
+    # --- conexión ---
     try:
-        if encoding == "gzip":
-            raw = gzip.decompress(raw)
-        elif encoding == "deflate":
-            raw = zlib.decompress(raw)
-        elif encoding == "br":
-            try:
-                import brotli
-                raw = brotli.decompress(raw)
-            except ImportError:
-                pass
-    except Exception:
-        pass
+        r = requests.post(
+            URL_BINANCE_P2P,
+            data=json.dumps(body),
+            headers=HEADERS_BINANCE,
+            timeout=20,
+            verify=False,
+        )
+    except requests.exceptions.RequestException as e:
+        print(f"[binance] {trade_type} error de conexión: {type(e).__name__}: {e}")
+        raise RuntimeError(f"Binance {trade_type}: {type(e).__name__}: {e}") from e
 
+    # --- HTTP ---
+    if r.status_code != 200:
+        cuerpo = r.text[:500] if r.text else "<vacío>"
+        print(f"[binance] {trade_type} HTTP {r.status_code}: {cuerpo}")
+        raise RuntimeError(f"Binance {trade_type} HTTP {r.status_code}: {cuerpo}")
+
+    # --- descompresión + parseo ---
+    raw = _descomprimir(r)
     try:
-        return json.loads(raw)
+        data = json.loads(raw)
     except (ValueError, TypeError):
-        return r.json()
+        # último intento: dejar que requests parsee
+        try:
+            data = r.json()
+        except Exception as e:
+            print(f"[binance] {trade_type} respuesta no es JSON: {raw[:300]!r}")
+            raise RuntimeError(f"Binance {trade_type} respuesta no es JSON") from e
+
+    # --- errores lógicos de Binance ---
+    # Binance devuelve {"code": "000000", "data": [...]} cuando todo OK.
+    code = data.get("code") if isinstance(data, dict) else None
+    if code not in (None, "000000", 0, "0"):
+        msg = data.get("message") or data.get("msg") or ""
+        print(f"[binance] {trade_type} code={code} msg={msg}")
+        raise RuntimeError(f"Binance {trade_type} code={code}: {msg}")
+
+    return data
 
 
 def procesar_datos_api(data):
-    """Toma los primeros 5 anuncios y normaliza los campos."""
-    if not data.get("data") or not isinstance(data["data"], list):
-        raise ValueError("Estructura de datos inválida")
+    """
+    Toma los primeros 5 anuncios y normaliza los campos.
+    Es tolerante a campos faltantes.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+        raise ValueError("Estructura de datos inválida (sin campo 'data')")
 
     anuncios = data["data"][:5]
     resultado = []
     for a in anuncios:
-        adv = a.get("adv", {})
-        advertiser = a.get("advertiser", {})
+        if not isinstance(a, dict):
+            continue
+        adv = a.get("adv") or {}
+        advertiser = a.get("advertiser") or {}
         metodos = adv.get("tradeMethods") or []
+
+        try:
+            precio = float(adv.get("price", 0) or 0)
+        except (TypeError, ValueError):
+            precio = 0.0
+        if precio <= 0:
+            continue
+
+        metodo_nombre = "Desconocido"
+        if metodos and isinstance(metodos[0], dict):
+            metodo_nombre = metodos[0].get("tradeMethodName", "Desconocido")
+
         resultado.append({
-            "precio": float(adv.get("price", 0)),
+            "precio": precio,
             "min": adv.get("minSingleTransAmount"),
             "max": adv.get("maxSingleTransAmount"),
-            "metodo": metodos[0].get("tradeMethodName", "Desconocido") if metodos else "Desconocido",
+            "metodo": metodo_nombre,
             "disponible": adv.get("surplusAmount", "0"),
             "advertiser": advertiser.get("nickName", "Anónimo"),
         })
+
     return resultado
 
 
@@ -105,12 +171,31 @@ def calcular_promedio(precios):
 
 
 def fetch_rates(importe=IMPORTE_DEFAULT, pay_types=None):
-    """Consulta BUY y SELL en paralelo y devuelve los promedios."""
-    data_compra = obtener_tasas_binance(importe, "BUY", pay_types)
-    data_venta = obtener_tasas_binance(importe, "SELL", pay_types)
+    """
+    Consulta BUY y SELL.
+    Tolera que uno de los dos falle: devuelve al menos lo que sí funcionó.
+    Si ambos fallan, lanza RuntimeError con el motivo.
+    """
+    precios_compra = []
+    precios_venta = []
+    errores = []
 
-    precios_compra = procesar_datos_api(data_compra)
-    precios_venta = procesar_datos_api(data_venta)
+    try:
+        data_compra = obtener_tasas_binance(importe, "BUY", pay_types)
+        precios_compra = procesar_datos_api(data_compra)
+    except Exception as e:
+        errores.append(f"BUY: {e}")
+        print(f"[fetch_rates] BUY falló: {e}")
+
+    try:
+        data_venta = obtener_tasas_binance(importe, "SELL", pay_types)
+        precios_venta = procesar_datos_api(data_venta)
+    except Exception as e:
+        errores.append(f"SELL: {e}")
+        print(f"[fetch_rates] SELL falló: {e}")
+
+    if not precios_compra and not precios_venta:
+        raise RuntimeError("Binance no devolvió datos | " + " | ".join(errores))
 
     return {
         "compra": calcular_promedio(precios_compra),
@@ -161,6 +246,7 @@ def consultar_tasas_bcv():
     """
     try:
         from bs4 import BeautifulSoup
+
         r = requests.get(URL_BCV, headers=HEADERS_BCV, timeout=15, verify=False)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
@@ -190,5 +276,5 @@ def consultar_tasas_bcv():
         return {"usd": usd, "eur": eur, "fecha": fecha}
 
     except Exception as e:
-        print(f"[BCV] Error consultando tasas: {e}")
+        print(f"[BCV] Error consultando tasas: {type(e).__name__}: {e}")
         return None
